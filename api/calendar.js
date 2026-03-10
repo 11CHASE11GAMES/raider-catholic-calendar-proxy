@@ -1,99 +1,94 @@
+import ical from "node-ical";
+
 const ICS_URL =
   "https://outlook.office365.com/owa/calendar/3f27e5fcd8c54156a67a04e6c92a556d@msoe.edu/39fd891e541a4016a9fecf8ed36628826223923538709763827/calendar.ics";
 
-function unfoldICSLines(icsText) {
-  return icsText.replace(/\r?\n[ \t]/g, "");
-}
+const LOOKAHEAD_DAYS = 90;
 
-function unescapeICSValue(value) {
+function stripHtml(value) {
   return value
-    .replace(/\\n/g, "\n")
-    .replace(/\\,/g, ",")
-    .replace(/\\;/g, ";")
-    .replace(/\\\\/g, "\\");
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p>/gi, "\n")
+    .replace(/<[^>]*>/g, "")
+    .trim();
 }
 
-function parseICSDate(rawValue) {
-  if (!rawValue) {
-    return null;
+function normalizeText(value) {
+  if (!value) {
+    return "";
   }
 
-  const value = rawValue.trim();
-
-  if (/^\d{8}$/.test(value)) {
-    const year = Number(value.slice(0, 4));
-    const month = Number(value.slice(4, 6)) - 1;
-    const day = Number(value.slice(6, 8));
-    return new Date(year, month, day);
-  }
-
-  if (/^\d{8}T\d{6}Z$/.test(value)) {
-    const year = Number(value.slice(0, 4));
-    const month = Number(value.slice(4, 6)) - 1;
-    const day = Number(value.slice(6, 8));
-    const hour = Number(value.slice(9, 11));
-    const minute = Number(value.slice(11, 13));
-    const second = Number(value.slice(13, 15));
-    return new Date(Date.UTC(year, month, day, hour, minute, second));
-  }
-
-  if (/^\d{8}T\d{6}$/.test(value)) {
-    const year = Number(value.slice(0, 4));
-    const month = Number(value.slice(4, 6)) - 1;
-    const day = Number(value.slice(6, 8));
-    const hour = Number(value.slice(9, 11));
-    const minute = Number(value.slice(11, 13));
-    const second = Number(value.slice(13, 15));
-    return new Date(year, month, day, hour, minute, second);
-  }
-
-  return null;
+  return stripHtml(String(value))
+    .replace(/\r\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
-function parseICS(icsText) {
-  const unfolded = unfoldICSLines(icsText);
-  const eventBlocks = unfolded.match(/BEGIN:VEVENT[\s\S]*?END:VEVENT/g) || [];
+function serializeEvent(event) {
+  return {
+    summary: event.summary || "Untitled Event",
+    description: normalizeText(event.description || ""),
+    location: normalizeText(event.location || ""),
+    start: event.start instanceof Date ? event.start.toISOString() : null,
+    end: event.end instanceof Date ? event.end.toISOString() : null
+  };
+}
 
-  return eventBlocks
-    .map((block) => {
-      const lines = block.split(/\r?\n/);
-      const event = {};
+function expandEvents(calendarData, fromDate, toDate) {
+  const results = [];
 
-      lines.forEach((line) => {
-        const separatorIndex = line.indexOf(":");
+  for (const entry of Object.values(calendarData)) {
+    if (!entry || entry.type !== "VEVENT" || !(entry.start instanceof Date)) {
+      continue;
+    }
 
-        if (separatorIndex === -1) {
-          return;
-        }
-
-        const keyPart = line.slice(0, separatorIndex);
-        const valuePart = line.slice(separatorIndex + 1);
-        const baseKey = keyPart.split(";")[0];
-
-        if (baseKey === "SUMMARY") {
-          event.summary = unescapeICSValue(valuePart);
-        }
-
-        if (baseKey === "DESCRIPTION") {
-          event.description = unescapeICSValue(valuePart);
-        }
-
-        if (baseKey === "LOCATION") {
-          event.location = unescapeICSValue(valuePart);
-        }
-
-        if (baseKey === "DTSTART") {
-          event.start = parseICSDate(valuePart);
-        }
-
-        if (baseKey === "DTEND") {
-          event.end = parseICSDate(valuePart);
-        }
+    if (entry.rrule) {
+      const instances = ical.expandRecurringEvent(entry, {
+        from: fromDate,
+        to: toDate,
+        includeOverrides: true,
+        excludeExdates: true,
+        expandOngoing: true
       });
 
-      return event;
-    })
-    .filter((event) => event.summary && event.start instanceof Date && !Number.isNaN(event.start.getTime()));
+      for (const instance of instances) {
+        if (!(instance.start instanceof Date)) {
+          continue;
+        }
+
+        const endDate =
+          instance.end instanceof Date
+            ? instance.end
+            : entry.end instanceof Date
+              ? new Date(instance.start.getTime() + (entry.end.getTime() - entry.start.getTime()))
+              : null;
+
+        results.push({
+          summary: instance.summary || entry.summary || "Untitled Event",
+          description: instance.description || entry.description || "",
+          location: instance.location || entry.location || "",
+          start: instance.start,
+          end: endDate
+        });
+      }
+
+      continue;
+    }
+
+    const effectiveEnd = entry.end instanceof Date ? entry.end : entry.start;
+
+    if (effectiveEnd >= fromDate && entry.start <= toDate) {
+      results.push({
+        summary: entry.summary || "Untitled Event",
+        description: entry.description || "",
+        location: entry.location || "",
+        start: entry.start,
+        end: entry.end instanceof Date ? entry.end : null
+      });
+    }
+  }
+
+  return results;
 }
 
 export default async function handler(req, res) {
@@ -117,46 +112,25 @@ export default async function handler(req, res) {
       ? Math.min(limitParam, 20)
       : 5;
 
-    const response = await fetch(ICS_URL, {
-      method: "GET",
+    const fromDate = new Date();
+    const toDate = new Date(fromDate.getTime() + LOOKAHEAD_DAYS * 24 * 60 * 60 * 1000);
+
+    const calendarData = await ical.async.fromURL(ICS_URL, {
       headers: {
         "User-Agent": "Raider-Catholic-Calendar-Proxy"
       }
     });
 
-    if (!response.ok) {
-      return res.status(502).json({
-        error: "Failed to fetch ICS feed",
-        status: response.status
-      });
-    }
-
-    const icsText = await response.text();
-    const now = new Date();
-
-    const upcomingEvents = parseICS(icsText)
-      .filter((event) => {
-        if (event.end instanceof Date && !Number.isNaN(event.end.getTime())) {
-          return event.end >= now;
-        }
-
-        return event.start >= now;
-      })
+    const upcomingEvents = expandEvents(calendarData, fromDate, toDate)
+      .filter((event) => event.start instanceof Date)
       .sort((a, b) => a.start - b.start)
       .slice(0, limit)
-      .map((event) => ({
-        summary: event.summary,
-        description: event.description || "",
-        location: event.location || "",
-        start: event.start.toISOString(),
-        end: event.end instanceof Date && !Number.isNaN(event.end.getTime())
-          ? event.end.toISOString()
-          : null
-      }));
+      .map(serializeEvent);
 
     return res.status(200).json({
       source: "outlook-ics",
       count: upcomingEvents.length,
+      lookaheadDays: LOOKAHEAD_DAYS,
       events: upcomingEvents
     });
   } catch (error) {
